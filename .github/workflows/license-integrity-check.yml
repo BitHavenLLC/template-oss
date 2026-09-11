@@ -1,0 +1,148 @@
+name: License integrity check
+
+# Fails the check if the repo's root LICENSE file does not exactly match one
+# of BitHaven's two canonical license texts. Add this as a required status
+# check in an org-level ruleset so no repo can merge a change that silently
+# edits, replaces, or deletes its LICENSE file.
+#
+# On a violation this also comments on the PR (or files an issue, for a
+# direct push to main) and labels it, pinging @BitHaven/legal-admins, so a
+# red X in the checks tab isn't the only signal anyone sees.
+#
+# When you publish a new license version, update COMMUNITY_SHA256 /
+# OSS_SHA256 below to match, and roll the update out to every repo's LICENSE
+# file at the same time so this check keeps passing.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "LICENSE"
+  push:
+    branches: [main]
+    paths:
+      - "LICENSE"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-license:
+    runs-on: ubuntu-latest
+    outputs:
+      matched: ${{ steps.verify.outputs.matched }}
+      actual_sha: ${{ steps.verify.outputs.actual_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify LICENSE matches a canonical BitHaven license
+        id: verify
+        run: |
+          set -e
+
+          if [ ! -f LICENSE ]; then
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "actual_sha=none (file missing)" >> "$GITHUB_OUTPUT"
+            echo "::error::No LICENSE file found at repository root."
+            exit 1
+          fi
+
+          ACTUAL_SHA256=$(sha256sum LICENSE | awk '{print $1}')
+          echo "actual_sha=$ACTUAL_SHA256" >> "$GITHUB_OUTPUT"
+
+          # Canonical hashes — replace if you bump the license version.
+          COMMUNITY_SHA256="ccb24b5f53236963ee019fd3808d492349a6c3227c4a2caca670f5b07aed247c"
+          OSS_SHA256="d05abc65cc22b0e7ba47d9304216b21df57e3073f3781d6c70e11afa4285de39"
+
+          if [ "$ACTUAL_SHA256" = "$COMMUNITY_SHA256" ]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "LICENSE matches BitHaven Community License v1.1. OK."
+            exit 0
+          fi
+
+          if [ "$ACTUAL_SHA256" = "$OSS_SHA256" ]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "LICENSE matches BitHaven Open Source License v1.1. OK."
+            exit 0
+          fi
+
+          echo "matched=false" >> "$GITHUB_OUTPUT"
+          echo "::error::LICENSE does not match either canonical BitHaven license text (got sha256=$ACTUAL_SHA256). If this is an intentional license version bump, update the hashes in this workflow in the same PR."
+          exit 1
+
+  report-violation:
+    needs: check-license
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label the pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "license-violation";
+            try {
+              await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: label });
+            } catch (e) {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: label,
+                color: "b60205",
+                description: "LICENSE file does not match a canonical BitHaven license",
+              });
+            }
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [label],
+            });
+
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actualSha = "${{ needs.check-license.outputs.actual_sha }}";
+            const body = [
+              "\u26a0\ufe0f **License integrity check failed.**",
+              "",
+              "The `LICENSE` file in this PR doesn't match either canonical BitHaven license text (Community or Open Source).",
+              "",
+              `Actual sha256: \`${actualSha}\``,
+              "",
+              "This can't merge until `LICENSE` is restored to match a canonical version, or the canonical hashes in `.github/workflows/license-integrity-check.yml` are updated as part of an intentional, approved license version change.",
+              "",
+              "cc @BitHaven/legal-admins",
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: File an issue for direct pushes to main
+        if: github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actualSha = "${{ needs.check-license.outputs.actual_sha }}";
+            const body = [
+              "The `LICENSE` file on `main` was just changed to something that does not match either canonical BitHaven license text.",
+              "",
+              `Commit: ${{ github.sha }}`,
+              `Actual sha256: \`${actualSha}\``,
+              "",
+              "This needs review from @BitHaven/legal-admins.",
+            ].join("\n");
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: "LICENSE integrity violation on main",
+              body,
+              labels: ["license-violation"],
+            });
